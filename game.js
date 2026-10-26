@@ -7,6 +7,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { RGBShiftShader } from 'three/addons/shaders/RGBShiftShader.js';
 import { VignetteShader } from 'three/addons/shaders/VignetteShader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // ---------- Base values (upgrades add on top of these) ----------
 const ARENA_BASE_HALF = 22;          // arena spans -22..22 on X and Z
@@ -30,6 +31,16 @@ const SWORD_KNOCKBACK = 9;      // initial push speed on the bot when hit
 const KNOCKBACK_DECAY = 6;      // higher = push stops sooner
 const BOT_STUN_TIME = 0.45;     // seconds the bot can't walk or attack after a hit
 
+// Shield: hold Shift to raise it. It blocks the bot's hits while energy lasts.
+const SHIELD_MAX = 100;         // full shield energy
+const SHIELD_DRAIN = 35;        // energy used per second while raised
+const SHIELD_REGEN = 25;        // energy regained per second while lowered
+const SHIELD_HIT_COST = 20;     // energy lost each time a bot hit is blocked
+const SHIELD_REGEN_DELAY = 0.6; // seconds after lowering before regen starts
+let shieldEnergy = SHIELD_MAX;
+let shieldRegenDelay = 0;
+let shieldUp = false;
+
 const HIT_STOP_TIME = 0.06;     // seconds gameplay freezes on a landed hit
 const SHAKE_TIME = 0.18;        // seconds the camera shakes after a landed hit
 const SHAKE_STRENGTH = 0.06;    // max camera offset during a shake (world units)
@@ -40,20 +51,21 @@ const BOT_GLITCH_TIME = 0.7;    // seconds the CPU glitches after being hit
 const BOT_GLITCH_PALETTE = [0x00ff41, 0x050505, 0xffe600, 0x1e90ff, 0xff1a1a];
 
 const BOT_RADIUS = 0.5;
-const BASE_BOT_HP = 100;
-const BASE_BOT_SPEED = 3.4;
-const BASE_BOT_DAMAGE = 12;
+// Hardcore mode: the bot is tougher, hits harder, moves faster, and swings more often.
+const BASE_BOT_HP = 160;        // was 100
+const BASE_BOT_SPEED = 5.2;     // was 3.4
+const BASE_BOT_DAMAGE = 20;     // was 12
 const BASE_BOT_REWARD = 20;     // coins per CPU kill before CPU upgrades
 const BOT_STOP_DISTANCE = 1.8;  // bot stops walking when this close
 const BOT_ATTACK_RANGE = 2.2;
-const BOT_ATTACK_COOLDOWN = 1.1;
-const BOT_SWING_TIME = 0.5;
+const BOT_ATTACK_COOLDOWN = 0.6; // was 1.1
+const BOT_SWING_TIME = 0.3;      // was 0.5, so swings land faster
 const BOT_RESPAWN_TIME = 3;
 
 // Hard-CPU behavior. The numbers (HP, damage, speed) are unchanged; these add the tactics.
-const BOT_DODGE_CHANCE = 0.35;      // chance it sidesteps a swing that's about to land
-const BOT_DODGE_DELAY = 0.12;       // seconds it takes to react, so the dodge isn't instant
-const BOT_DODGE_COOLDOWN = 1.6;     // seconds before it can dodge again
+const BOT_DODGE_CHANCE = 0.5;       // chance it sidesteps a swing that's about to land (was 0.35)
+const BOT_DODGE_DELAY = 0.08;       // seconds it takes to react (was 0.12)
+const BOT_DODGE_COOLDOWN = 1.0;     // seconds before it can dodge again (was 1.6)
 const BOT_BLOCK_CHANCE = 0.3;       // chance it raises its sword to block a hit
 const BOT_BLOCK_DAMAGE_MULT = 0.4;  // a blocked hit does 40% damage (60% reduction)
 const BOT_STRAFE_RANGE = 1.9;       // distance it tries to hold while circling (inside its attack range and your sword reach)
@@ -182,6 +194,11 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x556644, 0.9));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
 sun.position.set(10, 20, 10);
 scene.add(sun);
+
+// Reflection environment: gives shiny materials something to mirror, such as the polished bot armour.
+// Matte materials ignore it, so the rest of the arena looks the same.
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
 // ---------- Bloom (neon glow) ----------
 // The scene renders through a composer so bright neon pieces spill light onto their surroundings.
@@ -665,6 +682,53 @@ const gemMat = new THREE.MeshBasicMaterial({ color: 0xff2bd6 });
 const gemGeo = new THREE.OctahedronGeometry(0.045);
 const gripGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.22, 8);
 const wrapGeo = new THREE.TorusGeometry(0.032, 0.008, 6, 12);
+
+// A second, longer sword for the bot's left hand: a broad, curved blade with a long two-handed grip.
+// It has its own geometry rather than reusing the right-hand sword.
+const backBladeShape = new THREE.Shape();
+backBladeShape.moveTo(-0.07, 0);
+backBladeShape.lineTo(-0.07, 0.95);
+backBladeShape.quadraticCurveTo(0, 1.08, 0.07, 0.95);
+backBladeShape.lineTo(0.07, 0);
+backBladeShape.lineTo(-0.07, 0);
+const backBladeGeo = new THREE.ExtrudeGeometry(backBladeShape, { depth: 0.02, bevelEnabled: false });
+backBladeGeo.translate(0, 0, -0.01);
+const backGripGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.42, 10);
+const backGuardGeo = new THREE.BoxGeometry(0.34, 0.05, 0.08);
+
+function buildBackSwordMesh() {
+  const sword = new THREE.Group();
+
+  // Steel blade with a neon edge glow along its spine.
+  const blade = new THREE.Mesh(backBladeGeo, steelMat);
+  blade.position.y = 0.0;
+  const edge = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.9, 0.03), coreMat);
+  edge.position.set(0, 0.5, 0);
+  sword.add(blade, edge);
+
+  // Round guard (tsuba) with a neon rim.
+  const guard = new THREE.Mesh(backGuardGeo, goldMat);
+  guard.position.y = -0.04;
+  sword.add(guard);
+
+  // Long two-handed grip with gold wraps.
+  const grip = new THREE.Mesh(backGripGeo, gripMat);
+  grip.position.y = -0.27;
+  sword.add(grip);
+  for (const y of [-0.2, -0.27, -0.34]) {
+    const wrap = new THREE.Mesh(wrapGeo, goldMat);
+    wrap.rotation.x = Math.PI / 2;
+    wrap.position.y = y;
+    sword.add(wrap);
+  }
+
+  // Pommel gem.
+  const pommel = new THREE.Mesh(new THREE.SphereGeometry(0.045, 10, 8), gemMat);
+  pommel.position.y = -0.5;
+  sword.add(pommel);
+
+  return sword;
+}
 
 function buildSwordMesh() {
   const sword = new THREE.Group();
@@ -1293,6 +1357,11 @@ function buildBot() {
   botSword.position.set(0, -0.7, 0);
   botSword.rotation.x = Math.PI;
   armR.add(botSword);
+  // Second sword in the left hand, carried diagonally across the back so it clears the right-hand blade.
+  const backSword = buildBackSwordMesh();
+  backSword.position.set(0, -0.7, 0.06);
+  backSword.rotation.set(0.4, 0, -0.5);
+  armL.add(backSword);
 
   // Neon details (visual only). Basic materials ignore lighting, so they stay bright.
   // They are kept out of `mats`, so the red hit flash skips them. The hit glitch still
@@ -1305,11 +1374,10 @@ function buildBot() {
     return m;
   };
   // Chest stripe and visor line on the front (the bot faces -Z in its local space).
-  const chestStripe = glow(0.42, 0.06, 0.02, neonCyanMat, 0, 1.25, -0.18);
-  const visorLine = glow(0.44, 0.04, 0.02, neonMagentaMat, 0, 1.9, -0.26);
-  // Thin trim down both sides of the torso.
-  const trimL = glow(0.02, 0.75, 0.02, neonCyanMat, -0.31, 1.125, -0.18);
-  const trimR = glow(0.02, 0.75, 0.02, neonMagentaMat, 0.31, 1.125, -0.18);
+  const chestStripe = glow(0.42, 0.06, 0.02, neonCyanMat, 0, 1.25, -0.21);
+  // Thin trim down both sides of the torso. Positioned just outside the chestplate (see below).
+  const trimL = glow(0.02, 0.75, 0.02, neonCyanMat, -0.33, 1.125, -0.2);
+  const trimR = glow(0.02, 0.75, 0.02, neonMagentaMat, 0.33, 1.125, -0.2);
   // Halo ring floating above the head. It is tilted, so spinning the group reads as motion.
   const halo = new THREE.Group();
   halo.position.y = 2.55;
@@ -1317,8 +1385,82 @@ function buildBot() {
   haloRing.rotation.x = Math.PI / 2 - 0.45;
   halo.add(haloRing);
 
+  // Armour (visual only). Each piece is parented to the body part it covers, so it moves with it.
+  // Plates sit a hair outside the body box to avoid z-fighting. Steel is kept out of `mats`,
+  // so the red hit flash doesn't wash it out; the hit glitch still walks these meshes.
+  // Polished steel: low roughness and a clear coat, so it reflects the environment like a mirror finish.
+  // Battle-worn plates are a slightly duller, darker steel, so the set looks used rather than new.
+  // envMapIntensity boosts the reflections, because the arena is dark and metal otherwise reads black.
+  // Metalness is below 1 so the scene's own lights add a bright silver base; the environment adds the sheen.
+  const polishedSteel = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 0.6, roughness: 0.05, clearcoat: 1.0, clearcoatRoughness: 0.02, envMapIntensity: 1.8,
+  });
+  const wornSteel = new THREE.MeshPhysicalMaterial({
+    color: 0xb8c2d2, metalness: 0.5, roughness: 0.18, clearcoat: 0.6, clearcoatRoughness: 0.15, envMapIntensity: 2.2,
+  });
+  const darkSteel = new THREE.MeshPhysicalMaterial({
+    color: 0x2e3440, metalness: 0.9, roughness: 0.14, clearcoat: 0.8, clearcoatRoughness: 0.08, envMapIntensity: 1.8,
+  });
+  // White glints: small bright strips that catch the light, so the polish shows at a distance.
+  const glintMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+  const plate = (w, h, d, material, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+    m.position.set(x, y, z);
+    return m;
+  };
+  // A small chipped or dented scuff on a plate's front face. Visual only.
+  const scuff = (w, h, parent, x, y, z) => {
+    const m = plate(w, h, 0.01, wornSteel, x, y, z);
+    parent.add(m);
+    return m;
+  };
+
+  // Helmet: a polished shell over the head, with a dark crest and a flared brim.
+  // The shell covers only the top of the head (1.88 to 2.08), so the eyes at 1.8 stay visible.
+  const helmet = plate(0.56, 0.2, 0.56, polishedSteel, 0, 1.98, 0);
+  const helmetCrest = plate(0.08, 0.2, 0.42, darkSteel, 0, 2.16, 0.02);
+  const helmetBrim = plate(0.6, 0.04, 0.6, wornSteel, 0, 1.88, 0);
+  // Neon visor bar under the helmet brim, just in front of the eyes.
+  const visorSlit = plate(0.4, 0.04, 0.03, neonMagentaMat, 0, 1.86, -0.3);
+  root.add(helmet, helmetCrest, helmetBrim, visorSlit);
+
+  // Chestplate: polished, with a worn scuff on the front and a neon edge along its bottom.
+  const chestplate = plate(0.64, 0.6, 0.39, polishedSteel, 0, 1.2, 0);
+  const chestEdge = plate(0.66, 0.03, 0.41, neonCyanMat, 0, 0.88, 0);
+  root.add(chestplate, chestEdge);
+  root.add(scuff(0.18, 0.1, root, -0.12, 1.3, -0.2));
+  root.add(scuff(0.12, 0.08, root, 0.16, 1.06, -0.2));
+  // Two glints across the chest, and one on the helmet, for a polished highlight.
+  // Glints sit just in front of the plate face (the face is at z = -0.195), so they don't z-fight.
+  root.add(plate(0.2, 0.025, 0.01, glintMat, -0.14, 1.36, -0.21));
+  root.add(plate(0.12, 0.025, 0.01, glintMat, 0.16, 1.14, -0.21));
+  root.add(plate(0.3, 0.02, 0.01, glintMat, 0, 2.04, -0.29));
+
+  // Pauldrons: a worn shoulder plate with a spike on each arm group, so both swing with the arm.
+  for (const arm of [armL, armR]) {
+    const side = arm === armL ? -1 : 1;
+    arm.add(plate(0.3, 0.16, 0.3, wornSteel, side * 0.02, -0.04, 0));
+    // Spike on top of the pauldron, angled outward.
+    const spike = plate(0.05, 0.16, 0.05, polishedSteel, side * 0.02, 0.06, 0);
+    spike.rotation.z = side * -0.4;
+    arm.add(spike);
+    // Glint on the top of the pauldron.
+    arm.add(plate(0.18, 0.02, 0.02, glintMat, side * 0.02, 0.02, -0.16));
+  }
+
+  // Greaves and boots: polished greaves and worn boots on each leg group, so they swing with the walk.
+  for (const leg of [legL, legR]) {
+    leg.add(plate(0.27, 0.5, 0.27, polishedSteel, 0, -0.3, 0));
+    leg.add(plate(0.29, 0.14, 0.31, darkSteel, 0, -0.7, -0.02));
+  }
+
+  // Cape: a dark hanging cloth behind the shoulders, with a worn edge.
+  const cape = plate(0.56, 0.9, 0.04, darkSteel, 0, 1.0, 0.22);
+  cape.rotation.x = 0.08;
+  root.add(cape);
+
   root.add(legL, legR, torso, head, eyeL, eyeR, armL, armR);
-  root.add(chestStripe, visorLine, trimL, trimR, halo);
+  root.add(chestStripe, trimL, trimR, halo);
   return { root, legL, legR, armL, armR, mats, halo };
 }
 
@@ -1375,6 +1517,8 @@ let matchActive = false;   // true only while playing (not in a menu)
 
 // ---------- DOM refs ----------
 const playerFill = document.getElementById('playerFill');
+const shieldFill = document.getElementById('shieldFill');
+const shieldStateEl = document.getElementById('shieldState');
 const botFill = document.getElementById('botFill');
 const scoreEl = document.getElementById('score');
 const coinsHudEl = document.getElementById('coinsHud');
@@ -1584,6 +1728,14 @@ function killBot() {
 
 function damagePlayer(amount, dirFromBot) {
   if (player.dead) return;
+  // Shield: while raised with energy left, the hit is blocked. No damage, no knockback, no streak loss.
+  if (shieldUp && shieldEnergy > 0) {
+    shieldEnergy = Math.max(0, shieldEnergy - SHIELD_HIT_COST);
+    shieldRegenDelay = SHIELD_REGEN_DELAY;
+    hurtTimer = 0.12; // brief flash, so the block is visible
+    if (shieldEnergy <= 0) shieldUp = false; // broke the shield
+    return;
+  }
   player.hp = Math.max(0, player.hp - amount);
   streak = 0; // a death ends the streak
   player.knock.addScaledVector(dirFromBot, 6);
@@ -1603,6 +1755,10 @@ function respawnPlayer() {
   player.onGround = true;
   player.hp = stats.playerMaxHp;
   player.dead = false;
+  // A fresh life starts with a full shield, and the raised state is dropped.
+  shieldEnergy = SHIELD_MAX;
+  shieldUp = false;
+  shieldRegenDelay = 0;
   player.swinging = false;
   // Face the bot.
   const dx = BOT_SPAWN.x - PLAYER_SPAWN.x;
@@ -1627,7 +1783,40 @@ const tmpFwd = new THREE.Vector3();
 const tmpRight = new THREE.Vector3();
 const tmpMove = new THREE.Vector3();
 
+// First-person shield: a translucent blue-white bubble in front of the camera, shown only while raised.
+// It is a child of the camera, so it stays in view, and it has no collision.
+const shieldMat = new THREE.MeshBasicMaterial({
+  color: 0x4fd8ff, transparent: true, opacity: 0.0, depthWrite: false,
+  blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+});
+// A small dome held in the lower-left of the view, like a raised shield. Kept small and faint
+// so it doesn't wash out the arena.
+const shieldBubble = new THREE.Mesh(new THREE.SphereGeometry(1.0, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2), shieldMat);
+shieldBubble.position.set(-0.34, -0.16, -0.7);
+shieldBubble.rotation.x = -0.15;
+shieldBubble.scale.set(0.14, 0.11, 0.08);
+shieldBubble.visible = false;
+camera.add(shieldBubble);
+
+// Shield input and energy. Shift (either key) raises it while held and it can't stay up with no energy.
+function updateShield(dt) {
+  const wantsUp = Boolean((keys.ShiftLeft || keys.ShiftRight) && !player.dead && currentScreen === 'match' && controls.isLocked);
+  shieldUp = Boolean(wantsUp && shieldEnergy > 0);
+  // Pulse the bubble while it's up, and hide it when it's down.
+  shieldBubble.visible = shieldUp;
+  if (shieldUp) shieldMat.opacity = 0.14 + 0.06 * Math.sin(performance.now() / 1000 * 8);
+  if (shieldUp) {
+    shieldEnergy = Math.max(0, shieldEnergy - SHIELD_DRAIN * dt);
+    if (shieldEnergy <= 0) shieldUp = false;
+    shieldRegenDelay = SHIELD_REGEN_DELAY;
+  } else {
+    shieldRegenDelay = Math.max(0, shieldRegenDelay - dt);
+    if (shieldRegenDelay <= 0) shieldEnergy = Math.min(SHIELD_MAX, shieldEnergy + SHIELD_REGEN * dt);
+  }
+}
+
 function updatePlayer(dt) {
+  updateShield(dt);
   if (player.dead) {
     player.respawnTimer -= dt;
     if (player.respawnTimer <= 0) respawnPlayer();
@@ -1867,6 +2056,8 @@ function updateBot(dt) {
 function updateHUD(dt) {
   playerFill.style.width = `${Math.min(100, (player.hp / stats.playerMaxHp) * 100)}%`;
   botFill.style.width = `${Math.min(100, (bot.hp / stats.botMaxHp) * 100)}%`;
+  shieldFill.style.width = `${Math.min(100, (shieldEnergy / SHIELD_MAX) * 100)}%`;
+  shieldStateEl.textContent = shieldUp ? '(UP)' : '(Shift)';
   scoreEl.innerHTML = `Kills: ${kills} &nbsp; Deaths: ${deaths}`;
 
   if (player.dead && currentScreen === 'match') {
