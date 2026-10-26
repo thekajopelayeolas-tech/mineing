@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Minecraft Arena Duel</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    canvas { display: block; }
+    #hud, #crosshair, #message, #deathMsg, #hurt { display: none; }
+    body.in-match #hud,
+    body.in-match #crosshair,
+    body.in-match #message,
+    body.in-match #deathMsg,
+    body.in-match #hurt { display: block; }
+    #crosshair {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      width: 6px;
+      height: 6px;
+      margin: -3px 0 0 -3px;
+      background: #fff;
+      border: 1px solid #000;
+      box-sizing: border-box;
+      pointer-events: none;
+      z-index: 5;
+    }
+    #hud {
+      position: fixed;
+      left: 16px;
+      top: 16px;
+      width: 260px;
+      color: #fff;
+      text-shadow: 1px 1px 2px #000;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .label { font-weight: bold; margin-bottom: 4px; }
+    .bar {
+      width: 100%;
+      height: 18px;
+      background: #400;
+      border: 2px solid #000;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+    }
+    .fill {
+      height: 100%;
+      width: 100%;
+      background: #3c3;
+      transition: width 0.15s;
+    }
+    #botFill { background: #d33; }
+    #score { font-size: 16px; margin-top: 4px; }
+    #coinsHud { font-size: 16px; margin-top: 4px; color: #ffe066; }
+    #botStatus { font-size: 14px; margin-top: 6px; color: #ffe066; }
+    #message {
+      position: fixed;
+      top: 18%;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: #ffe066;
+      font-size: 28px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px #000;
+      pointer-events: none;
+      z-index: 5;
+    }
+    #deathMsg {
+      position: fixed;
+      top: 40%;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: #ff5555;
+      font-size: 36px;
+      font-weight: bold;
+      text-shadow: 2px 2px 4px #000;
+      pointer-events: none;
+      z-index: 5;
+    }
+    /* Scanlines: faint horizontal lines over the match, for the glitch look */
+    #scanlines {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      pointer-events: none;
+      z-index: 3;
+      display: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(0, 0, 0, 0) 0px,
+        rgba(0, 0, 0, 0) 2px,
+        rgba(0, 0, 0, 0.18) 3px,
+        rgba(0, 0, 0, 0) 4px
+      );
+    }
+    body.in-match #scanlines { display: block; }
+
+    /* Glitch title: the menu heading flickers and shifts in the palette colors */
+    .glitch-title {
+      position: relative;
+      font-size: 60px;
+      letter-spacing: 4px;
+      color: #fff;
+      text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff;
+      animation: glitchFlicker 2.4s infinite steps(1, end);
+    }
+    @keyframes glitchFlicker {
+      0%   { transform: translate(0, 0);      text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff; color: #fff; }
+      8%   { transform: translate(-3px, 1px); text-shadow: -4px 0 #00ff41, 4px 0 #ffe600; color: #050505; }
+      9%   { transform: translate(2px, -1px); text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff; color: #fff; }
+      40%  { transform: translate(0, 0);      text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff; color: #fff; }
+      47%  { transform: translate(4px, 0);    text-shadow: 4px 0 #ffe600, -4px 0 #00ff41; color: #ffe600; }
+      48%  { transform: translate(0, 0);      text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff; color: #fff; }
+      100% { transform: translate(0, 0);      text-shadow: 3px 0 #ff1a1a, -3px 0 #1e90ff; color: #fff; }
+    }
+
+    #hurt {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(255, 0, 0, 0.35);
+      opacity: 0;
+      pointer-events: none;
+      z-index: 4;
+    }
+
+    /* Menu, pause, and shop screens */
+    .screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.6);
+      color: #fff;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: safe center;
+      text-align: center;
+      overflow-y: auto;
+      padding: 16px 0;
+      box-sizing: border-box;
+    }
+    .screen.active { display: flex; }
+    .screen h1 { font-size: 52px; margin: 0 0 8px; text-shadow: 2px 2px 4px #000; }
+    .screen h2 { font-size: 22px; margin: 16px 0 6px; color: #ffe066; }
+    .screen p { font-size: 18px; line-height: 1.6; margin: 6px 0; }
+    .hint { font-size: 14px; color: #ccc; }
+    .btn {
+      background: #3a3a3a;
+      color: #fff;
+      border: 2px solid #000;
+      font-size: 20px;
+      padding: 10px 28px;
+      margin: 6px;
+      min-width: 240px;
+      cursor: pointer;
+      box-shadow: inset 0 -3px 0 rgba(0, 0, 0, 0.4);
+    }
+    .btn:hover:not(:disabled) { background: #555; }
+    .btn:disabled { background: #222; color: #777; cursor: not-allowed; }
+    .btn.small { min-width: 150px; font-size: 16px; padding: 8px 14px; margin: 0; }
+    .shop-list {
+      display: flex;
+      flex-direction: column;
+      width: 600px;
+      max-width: 92vw;
+    }
+    .shop-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(0, 0, 0, 0.5);
+      border: 2px solid #222;
+      padding: 10px 16px;
+      margin: 4px 0;
+      text-align: left;
+    }
+    .shop-name { font-size: 18px; font-weight: bold; }
+    .shop-name span { color: #ffe066; font-weight: normal; margin-left: 8px; font-size: 15px; }
+    .shop-desc { font-size: 14px; color: #ccc; }
+
+    /* Main menu: animated neon grid, colored glow spots, styled buttons, terminal subtitle */
+    .menu-screen {
+      background:
+        radial-gradient(circle at 20% 30%, rgba(255, 26, 26, 0.2), transparent 45%),
+        radial-gradient(circle at 80% 70%, rgba(30, 144, 255, 0.2), transparent 45%),
+        rgba(0, 0, 0, 0.85);
+      overflow: hidden;
+    }
+    .menu-screen::before {
+      content: "";
+      position: absolute;
+      inset: -50%;
+      background-image:
+        linear-gradient(rgba(0, 255, 65, 0.14) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 65, 0.14) 1px, transparent 1px);
+      background-size: 48px 48px;
+      transform: perspective(500px) rotateX(60deg);
+      animation: gridScroll 6s linear infinite;
+      pointer-events: none;
+      z-index: -1;
+    }
+    @keyframes gridScroll {
+      from { transform: perspective(500px) rotateX(60deg) translateY(0); }
+      to   { transform: perspective(500px) rotateX(60deg) translateY(48px); }
+    }
+
+    .menu-sub {
+      font-family: "Courier New", monospace;
+      color: #00ff41;
+      letter-spacing: 3px;
+      font-size: 16px;
+      margin: 0 0 18px;
+      text-shadow: 0 0 6px rgba(0, 255, 65, 0.6);
+    }
+    .menu-sub::after {
+      content: "_";
+      animation: blinkCursor 1s steps(1, end) infinite;
+    }
+    @keyframes blinkCursor {
+      50% { opacity: 0; }
+    }
+
+    .menu-btn {
+      position: relative;
+      min-width: 260px;
+      font-size: 22px;
+      font-weight: bold;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: #fff;
+      background: linear-gradient(135deg, rgba(20, 20, 20, 0.92), rgba(40, 0, 20, 0.92));
+      border: 2px solid #00ff41;
+      box-shadow: 0 0 12px rgba(0, 255, 65, 0.35), inset 0 0 8px rgba(255, 230, 0, 0.15);
+      transition: transform 0.08s, box-shadow 0.15s, border-color 0.15s;
+    }
+    .menu-btn:hover:not(:disabled) {
+      transform: translateX(6px) skewX(-6deg);
+      border-color: #ffe600;
+      background: linear-gradient(135deg, #1a1a1a, #2a0010);
+      box-shadow: 0 0 18px rgba(255, 26, 26, 0.6), 0 0 28px rgba(30, 144, 255, 0.45);
+    }
+    .menu-btn:active:not(:disabled) {
+      transform: translateX(2px) scale(0.98);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div class="label">You</div>
+    <div class="bar"><div class="fill" id="playerFill"></div></div>
+    <div class="label">CPU Bot</div>
+    <div class="bar"><div class="fill" id="botFill"></div></div>
+    <div id="score">Kills: 0 &nbsp; Deaths: 0</div>
+    <div id="coinsHud">Coins: <span class="coinLabel">0</span></div>
+    <div id="botStatus"></div>
+  </div>
+
+  <div id="crosshair"></div>
+  <div id="hurt"></div>
+  <div id="scanlines"></div>
+  <div id="message"></div>
+  <div id="deathMsg"></div>
+
+  <div id="menu" class="screen menu-screen active">
+    <h1 class="glitch-title">Arena Duel</h1>
+    <p class="menu-sub">&gt; SELECT MODE</p>
+    <p>Coins: <span class="coinLabel">0</span></p>
+    <button class="btn menu-btn" id="playBtn">Play</button>
+    <button class="btn menu-btn" id="onlineBtn">Play Online</button>
+    <button class="btn menu-btn" id="menuShopBtn">Shop</button>
+    <p class="hint">WASD move | Mouse look | Space jump | Left click swing sword | Esc pause</p>
+  </div>
+
+  <div id="online" class="screen">
+    <h1>Online</h1>
+    <p class="hint">Create a lobby, or join one. Each match is 1 vs 1.</p>
+    <button class="btn" id="createLobbyBtn">Create Lobby</button>
+    <h2>Open Lobbies</h2>
+    <div class="shop-list" id="lobbyList"></div>
+    <p class="hint" id="onlineStatus"></p>
+    <button class="btn" id="onlineBackBtn">Back</button>
+  </div>
+
+  <div id="pause" class="screen">
+    <h1>Paused</h1>
+    <p>Coins: <span class="coinLabel">0</span></p>
+    <button class="btn" id="resumeBtn">Resume</button>
+    <button class="btn" id="pauseShopBtn">Shop</button>
+    <button class="btn" id="quitBtn">Quit to Menu</button>
+  </div>
+
+  <div id="shop" class="screen">
+    <h1>Shop</h1>
+    <p>Coins: <span class="coinLabel">0</span></p>
+    <h2>Your Upgrades</h2>
+    <div class="shop-list" id="shopPlayer"></div>
+    <h2>CPU Upgrades</h2>
+    <p class="hint">Stronger CPU upgrades earn you more coins per kill.</p>
+    <div class="shop-list" id="shopCpu"></div>
+    <button class="btn" id="shopBackBtn">Back</button>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./node_modules/three/build/three.module.js",
+      "three/addons/": "./node_modules/three/examples/jsm/"
+    }
+  }
+  </script>
+  <script src="./online.js"></script>
+  <script type="module" src="./game.js"></script>
+</body>
+</html>
