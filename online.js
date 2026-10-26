@@ -34,7 +34,18 @@ function connectOnline() {
       emitOnline(type, data);
     });
   }
-  source.onerror = () => emitOnline('connection', { ok: false });
+  source.addEventListener('hello', () => emitOnline('connection', { ok: true }));
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) {
+      // The browser gave up on this stream. Drop it and open a new one shortly.
+      online.events = null;
+      emitOnline('connection', { ok: false, retrying: true });
+      setTimeout(connectOnline, 2000);
+    } else {
+      // The browser is retrying on its own (for example after the tab was suspended).
+      emitOnline('connection', { ok: false, retrying: true });
+    }
+  };
 }
 
 async function postOnline(path, body) {

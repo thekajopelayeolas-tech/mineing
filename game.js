@@ -1,8 +1,15 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { RGBShiftShader } from 'three/addons/shaders/RGBShiftShader.js';
+import { VignetteShader } from 'three/addons/shaders/VignetteShader.js';
 
 // ---------- Base values (upgrades add on top of these) ----------
-const ARENA_HALF = 22;          // arena spans -22..22 on X and Z
+const ARENA_BASE_HALF = 22;          // arena spans -22..22 on X and Z
 const WALL_HEIGHT = 6;
 const WALL_THICKNESS = 1;
 const GRAVITY = -26;
@@ -83,7 +90,20 @@ const CPU_UPGRADES = [
   { key: 'cpuDamage', label: 'CPU Damage', desc: '+3 damage per level' },
   { key: 'cpuSpeed', label: 'CPU Speed', desc: '+0.4 speed per level' },
 ];
-const ALL_UPGRADE_KEYS = [...PLAYER_UPGRADES, ...CPU_UPGRADES].map((u) => u.key);
+// Arena upgrades change the arena's size, shape, and seating. The arena is built once at startup.
+const ARENA_UPGRADES = [
+  { key: 'arenaSize', label: 'Bigger Arena', desc: '+6 units per side per level', max: 3, cost: 100 },
+  { key: 'arenaRound', label: 'Round Arena', desc: 'Circular walls, floor, and boundary', max: 1, cost: 300 },
+  { key: 'seats', label: 'Stadium Seats', desc: 'Tiered seating around the arena', max: 3, cost: 120 },
+];
+const ALL_UPGRADES = [...PLAYER_UPGRADES, ...CPU_UPGRADES, ...ARENA_UPGRADES];
+const ARENA_UPGRADE_KEYS = ARENA_UPGRADES.map((u) => u.key);
+const ALL_UPGRADE_KEYS = ALL_UPGRADES.map((u) => u.key);
+
+// Per-item level cap. Items without their own `max` use MAX_LEVEL.
+function upgradeMax(key) {
+  return ALL_UPGRADES.find((u) => u.key === key)?.max ?? MAX_LEVEL;
+}
 
 function freshSave() {
   return { coins: 0, levels: Object.fromEntries(ALL_UPGRADE_KEYS.map((k) => [k, 0])) };
@@ -96,7 +116,7 @@ function loadSave() {
     const data = JSON.parse(raw);
     const levels = {};
     for (const k of ALL_UPGRADE_KEYS) {
-      levels[k] = THREE.MathUtils.clamp(Math.floor(Number(data.levels?.[k]) || 0), 0, MAX_LEVEL);
+      levels[k] = THREE.MathUtils.clamp(Math.floor(Number(data.levels?.[k]) || 0), 0, upgradeMax(k));
     }
     return { coins: Math.max(0, Math.floor(Number(data.coins) || 0)), levels };
   } catch (err) {
@@ -107,6 +127,12 @@ function loadSave() {
 
 let save = loadSave();
 
+// Arena size and shape come from saved upgrades. They are read once at startup, so a
+// purchase shows up after the page reloads.
+const ARENA_HALF = ARENA_BASE_HALF + 6 * save.levels.arenaSize;
+const ARENA_ROUND = save.levels.arenaRound > 0;
+const SEAT_TIERS = save.levels.seats;
+
 function saveProgress() {
   try {
     localStorage.setItem(SAVE_KEY, JSON.stringify(save));
@@ -116,7 +142,8 @@ function saveProgress() {
 }
 
 function upgradeCost(key) {
-  return UPGRADE_BASE_COST * (save.levels[key] + 1);
+  const base = ALL_UPGRADES.find((u) => u.key === key)?.cost ?? UPGRADE_BASE_COST;
+  return base * (save.levels[key] + 1);
 }
 
 // Converts the saved upgrade levels into the numbers the game uses.
@@ -142,8 +169,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
-scene.fog = new THREE.Fog(0x87ceeb, 30, 80);
+// Night-purple sky, so the neon edges and glitch side stand out.
+const SKY_COLOR = 0x140a24;
+scene.background = new THREE.Color(SKY_COLOR);
+scene.fog = new THREE.Fog(SKY_COLOR, 30, 80);
 
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.05, 200);
 camera.rotation.order = 'YXZ';
@@ -153,6 +182,23 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x556644, 0.9));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
 sun.position.set(10, 20, 10);
 scene.add(sun);
+
+// ---------- Bloom (neon glow) ----------
+// The scene renders through a composer so bright neon pieces spill light onto their surroundings.
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+// Arguments: resolution, strength, radius, luminance threshold.
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.5, 0.5, 0.5));
+// Chromatic split (color fringes) that spikes now and then, like a corrupted signal.
+const rgbShiftPass = new ShaderPass(RGBShiftShader);
+rgbShiftPass.uniforms.amount.value = 0.0015;
+composer.addPass(rgbShiftPass);
+// Darkens the screen edges to focus the eye on the arena.
+const vignettePass = new ShaderPass(VignetteShader);
+vignettePass.uniforms.offset.value = 1.0;
+vignettePass.uniforms.darkness.value = 1.3;
+composer.addPass(vignettePass);
+composer.addPass(new OutputPass());
 
 // ---------- Helpers ----------
 function lambert(color) {
@@ -192,8 +238,17 @@ function addBlock(w, h, d, x, y, z, color) {
 // Keeps a feet-level position inside the arena walls and outside the pillars.
 function constrainToArena(pos, radius) {
   const limit = ARENA_HALF - radius;
-  pos.x = THREE.MathUtils.clamp(pos.x, -limit, limit);
-  pos.z = THREE.MathUtils.clamp(pos.z, -limit, limit);
+  if (ARENA_ROUND) {
+    // Circular arena: pull the position back onto the circle of radius `limit`.
+    const d = Math.hypot(pos.x, pos.z);
+    if (d > limit) {
+      pos.x *= limit / d;
+      pos.z *= limit / d;
+    }
+  } else {
+    pos.x = THREE.MathUtils.clamp(pos.x, -limit, limit);
+    pos.z = THREE.MathUtils.clamp(pos.z, -limit, limit);
+  }
   for (const p of PILLARS) {
     const dx = pos.x - p.x;
     const dz = pos.z - p.z;
@@ -264,19 +319,60 @@ function addFloorHalf(centerX, material) {
   plane.position.set(centerX, 0, 0);
   scene.add(plane);
 }
-addFloorHalf(-HALF_SPAN / 2, new THREE.MeshLambertMaterial({ map: normalFloorTex }));
-addFloorHalf(HALF_SPAN / 2, new THREE.MeshLambertMaterial({ map: glitchFloorTex }));
+// Open-ended ring segment, used for round walls and rim bands. The angle range picks which half it covers.
+function addRingBand(radius, y, height, thetaStart, thetaLength, material) {
+  const geo = new THREE.CylinderGeometry(radius, radius, height, 96, 1, true, thetaStart, thetaLength);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.y = y;
+  scene.add(mesh);
+  return mesh;
+}
+function addRingWall(radius, thetaStart, thetaLength, material) {
+  return addRingBand(radius, WALL_HEIGHT / 2, WALL_HEIGHT, thetaStart, thetaLength, material);
+}
+
+// Round arena: each floor half is a half-disc, so the floor matches the circular walls.
+function addRoundFloorHalf(side, material) {
+  // Normal half (x < 0) spans angles [PI/2, 3PI/2]; the glitch half (x > 0) spans [-PI/2, PI/2].
+  const start = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+  const geo = new THREE.CircleGeometry(ARENA_HALF, 96, start, Math.PI);
+  // The textures' repeat values are set for the square planes, so remap UVs to the same tile sizes.
+  const pos = geo.attributes.position;
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    uv.setXY(i, pos.getX(i) / HALF_SPAN, pos.getY(i) / (ARENA_HALF * 2));
+  }
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.rotation.x = -Math.PI / 2;
+  scene.add(mesh);
+}
+
+if (ARENA_ROUND) {
+  addRoundFloorHalf(-1, new THREE.MeshLambertMaterial({ map: normalFloorTex }));
+  addRoundFloorHalf(1, new THREE.MeshLambertMaterial({ map: glitchFloorTex }));
+} else {
+  addFloorHalf(-HALF_SPAN / 2, new THREE.MeshLambertMaterial({ map: normalFloorTex }));
+  addFloorHalf(HALF_SPAN / 2, new THREE.MeshLambertMaterial({ map: glitchFloorTex }));
+}
 
 const WALL_COLOR = 0x7d7d7d;
 const wallOffset = ARENA_HALF + WALL_THICKNESS / 2;
 const wallHalf = ARENA_HALF + WALL_THICKNESS;   // half the length of a north/south wall
 // North and south walls are split at x = 0: left stays gray, right is glitched.
-addBlock(WALL_THICKNESS, WALL_HEIGHT, ARENA_HALF * 2, -wallOffset, WALL_HEIGHT / 2, 0, WALL_COLOR);
-addBlock(WALL_THICKNESS, WALL_HEIGHT, ARENA_HALF * 2, wallOffset, WALL_HEIGHT / 2, 0, glitchMat);
-addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, -wallHalf / 2, WALL_HEIGHT / 2, -wallOffset, WALL_COLOR);
-addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, wallHalf / 2, WALL_HEIGHT / 2, -wallOffset, glitchMat);
-addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, -wallHalf / 2, WALL_HEIGHT / 2, wallOffset, WALL_COLOR);
-addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, wallHalf / 2, WALL_HEIGHT / 2, wallOffset, glitchMat);
+if (ARENA_ROUND) {
+  // Round arena: a ring of wall, gray on the x < 0 half and glitched on x > 0.
+  // Both sides need DoubleSide, because the wall is open-ended and we see its inside.
+  glitchMat.side = THREE.DoubleSide;
+  addRingWall(ARENA_HALF + WALL_THICKNESS / 2, Math.PI, Math.PI, new THREE.MeshLambertMaterial({ color: WALL_COLOR, side: THREE.DoubleSide }));
+  addRingWall(ARENA_HALF + WALL_THICKNESS / 2, 0, Math.PI, glitchMat);
+} else {
+  addBlock(WALL_THICKNESS, WALL_HEIGHT, ARENA_HALF * 2, -wallOffset, WALL_HEIGHT / 2, 0, WALL_COLOR);
+  addBlock(WALL_THICKNESS, WALL_HEIGHT, ARENA_HALF * 2, wallOffset, WALL_HEIGHT / 2, 0, glitchMat);
+  addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, -wallHalf / 2, WALL_HEIGHT / 2, -wallOffset, WALL_COLOR);
+  addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, wallHalf / 2, WALL_HEIGHT / 2, -wallOffset, glitchMat);
+  addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, -wallHalf / 2, WALL_HEIGHT / 2, wallOffset, WALL_COLOR);
+  addBlock(wallHalf, WALL_HEIGHT, WALL_THICKNESS, wallHalf / 2, WALL_HEIGHT / 2, wallOffset, glitchMat);
+}
 
 for (const p of PILLARS) {
   const pillar = new THREE.Mesh(
@@ -305,6 +401,249 @@ for (let i = 0; i < 8; i++) {
   glitchBars.push(bar);
 }
 let glitchTimer = 0;
+
+// ---------- Neon arena dressing (visual only, no collisions) ----------
+// Glowing strip helper. MeshBasicMaterial ignores lights, so these always look lit up.
+function addGlowStrip(w, h, d, x, y, z, material) {
+  const strip = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+  strip.position.set(x, y, z);
+  scene.add(strip);
+  return strip;
+}
+
+const neonCyan = new THREE.MeshBasicMaterial({ color: 0x00f0ff });
+const neonMagenta = new THREE.MeshBasicMaterial({ color: GLITCH_COLORS[0] });
+const NEON_THICKNESS = WALL_THICKNESS * 0.35;
+
+// Glowing rim along the top of the walls: cyan on the normal side, magenta on the glitch side.
+const RIM_Y = WALL_HEIGHT + 0.06;
+if (ARENA_ROUND) {
+  // Round arena: the rim is a band around the wall, cyan on x < 0 and magenta on x > 0.
+  neonCyan.side = THREE.DoubleSide;
+  neonMagenta.side = THREE.DoubleSide;
+  addRingBand(ARENA_HALF + WALL_THICKNESS / 2, RIM_Y, 0.12, Math.PI, Math.PI, neonCyan);
+  addRingBand(ARENA_HALF + WALL_THICKNESS / 2, RIM_Y, 0.12, 0, Math.PI, neonMagenta);
+} else {
+  addGlowStrip(ARENA_HALF * 2, 0.12, NEON_THICKNESS, 0, RIM_Y, -wallOffset, neonCyan);
+  addGlowStrip(ARENA_HALF * 2, 0.12, NEON_THICKNESS, 0, RIM_Y, wallOffset, neonMagenta);
+  addGlowStrip(NEON_THICKNESS, 0.12, ARENA_HALF * 2, -wallOffset, RIM_Y, 0, neonCyan);
+  addGlowStrip(NEON_THICKNESS, 0.12, ARENA_HALF * 2, wallOffset, RIM_Y, 0, neonMagenta);
+}
+
+// Neon outline on the floor where the arena meets the walls.
+const EDGE_INSET = ARENA_HALF - 0.1;
+const EDGE_Y = 0.02;
+if (ARENA_ROUND) {
+  // Round arena: the floor outline is two arcs, cyan on x < 0 and magenta on x > 0.
+  const outlineIn = ARENA_HALF - 0.25;
+  const outlineOut = ARENA_HALF - 0.1;
+  const outlineCyan = new THREE.Mesh(new THREE.RingGeometry(outlineIn, outlineOut, 96, 1, Math.PI / 2, Math.PI), neonCyan);
+  const outlineMagenta = new THREE.Mesh(new THREE.RingGeometry(outlineIn, outlineOut, 96, 1, -Math.PI / 2, Math.PI), neonMagenta);
+  for (const arc of [outlineCyan, outlineMagenta]) {
+    arc.rotation.x = -Math.PI / 2;
+    arc.position.y = EDGE_Y;
+    scene.add(arc);
+  }
+} else {
+  addGlowStrip(0.15, 0.02, ARENA_HALF * 2, -EDGE_INSET, EDGE_Y, 0, neonCyan);
+  addGlowStrip(0.15, 0.02, ARENA_HALF * 2, EDGE_INSET, EDGE_Y, 0, neonMagenta);
+  addGlowStrip(ARENA_HALF, 0.02, 0.15, -ARENA_HALF / 2, EDGE_Y, -EDGE_INSET, neonCyan);
+  addGlowStrip(ARENA_HALF, 0.02, 0.15, ARENA_HALF / 2, EDGE_Y, -EDGE_INSET, neonMagenta);
+  addGlowStrip(ARENA_HALF, 0.02, 0.15, -ARENA_HALF / 2, EDGE_Y, EDGE_INSET, neonCyan);
+  addGlowStrip(ARENA_HALF, 0.02, 0.15, ARENA_HALF / 2, EDGE_Y, EDGE_INSET, neonMagenta);
+}
+
+// ---------- Stadium seats (bought in the shop) ----------
+// Tiered stands outside the walls. They're decoration only: players can't reach them.
+const SEAT_DEPTH = 1.5;                         // depth of one tier
+const SEAT_START = ARENA_HALF + WALL_THICKNESS + 1; // first tier starts just past the wall
+const SEAT_MAT = new THREE.MeshLambertMaterial({ color: 0x2b2b44, side: THREE.DoubleSide });
+// Tiers are tall enough to clear the 6-unit walls, so the stands show above them.
+const seatHeight = (t) => WALL_HEIGHT * 0.5 + t * 1.5;
+
+if (SEAT_TIERS > 0) {
+  if (ARENA_ROUND) {
+    for (let t = 0; t < SEAT_TIERS; t++) {
+      const inner = SEAT_START + t * SEAT_DEPTH;
+      const outer = inner + SEAT_DEPTH;
+      const h = seatHeight(t);
+      addRingBand(outer, h / 2, h, 0, Math.PI * 2, SEAT_MAT);
+      const top = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 96), SEAT_MAT);
+      top.rotation.x = -Math.PI / 2;
+      top.position.y = h;
+      scene.add(top);
+      // Glowing lip on each tier: cyan on the x < 0 side, magenta on the x > 0 side.
+      addRingBand(inner, h + 0.03, 0.06, Math.PI, Math.PI, neonCyan);
+      addRingBand(inner, h + 0.03, 0.06, 0, Math.PI, neonMagenta);
+    }
+  } else {
+    // Spans the full width of the arena plus the stands on each side, so the corners are covered.
+    const seatSpan = (ARENA_HALF + SEAT_START + SEAT_TIERS * SEAT_DEPTH) * 2;
+    for (let t = 0; t < SEAT_TIERS; t++) {
+      const d = SEAT_START + t * SEAT_DEPTH + SEAT_DEPTH / 2; // distance from the center to this tier
+      const h = seatHeight(t);
+      for (const s of [-1, 1]) {
+        addBlock(seatSpan, h, SEAT_DEPTH, 0, h / 2, s * d, SEAT_MAT);   // north and south stands
+        addBlock(SEAT_DEPTH, h, seatSpan, s * d, h / 2, 0, SEAT_MAT);   // east and west stands
+        // Glowing lip on the arena-facing edge: cyan on the negative side, magenta on the positive.
+        const lip = s < 0 ? neonCyan : neonMagenta;
+        addGlowStrip(seatSpan, 0.06, 0.06, 0, h + 0.03, s * (d - SEAT_DEPTH / 2), lip);
+        addGlowStrip(0.06, 0.06, seatSpan, s * (d - SEAT_DEPTH / 2), h + 0.03, 0, lip);
+      }
+    }
+  }
+}
+
+// Glowing caps on top of each pillar.
+const pillarCapGeo = new THREE.CircleGeometry(PILLAR_RADIUS * 0.9, 16);
+// Translucent light beams rising from each cap. Visual only; they have no collision.
+const pillarBeams = [];
+const pillarBeamGeo = new THREE.CylinderGeometry(PILLAR_RADIUS * 0.6, PILLAR_RADIUS * 0.6, 6, 12, 1, true);
+for (const p of PILLARS) {
+  const capMat = p.x > 0 ? neonMagenta : neonCyan;
+  const cap = new THREE.Mesh(pillarCapGeo, capMat);
+  cap.rotation.x = -Math.PI / 2;
+  cap.position.set(p.x, PILLAR_HEIGHT + 0.01, p.z);
+  scene.add(cap);
+
+  const beamMat = new THREE.MeshBasicMaterial({
+    color: capMat.color,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+  });
+  const beam = new THREE.Mesh(pillarBeamGeo, beamMat);
+  beam.position.set(p.x, PILLAR_HEIGHT + 3, p.z);
+  scene.add(beam);
+  pillarBeams.push(beamMat);
+}
+
+// Colored lights: cool cyan over the normal side, magenta over the glitch side.
+// The magenta light follows the glitch color cycle in updateGlitch.
+const cyanLight = new THREE.PointLight(0x00f0ff, 120, 40, 2);
+cyanLight.position.set(-11, 5, 0);
+scene.add(cyanLight);
+const glitchLight = new THREE.PointLight(GLITCH_COLORS[0], 120, 40, 2);
+glitchLight.position.set(11, 5, 0);
+scene.add(glitchLight);
+
+// Glowing ring on the arena floor: a cyan arc on the normal side, a magenta arc on the glitch side.
+// Visual only, with no collision. Its opacity pulses in updateNeon.
+const ringCyanMat = new THREE.MeshBasicMaterial({
+  color: 0x00f0ff, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+});
+const ringMagentaMat = new THREE.MeshBasicMaterial({
+  color: GLITCH_COLORS[0], transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+});
+const centerRing = new THREE.Group();
+centerRing.position.set(0, 0.03, 0);
+// RingGeometry lies in the XY plane. Rotating it flat keeps x, so the left arc is the x < 0 half.
+const ringCyanArc = new THREE.Mesh(new THREE.RingGeometry(3.6, 4, 48, 1, Math.PI / 2, Math.PI), ringCyanMat);
+const ringMagentaArc = new THREE.Mesh(new THREE.RingGeometry(3.6, 4, 48, 1, -Math.PI / 2, Math.PI), ringMagentaMat);
+for (const arc of [ringCyanArc, ringMagentaArc]) {
+  arc.rotation.x = -Math.PI / 2;
+  centerRing.add(arc);
+}
+scene.add(centerRing);
+
+// Floating motes that drift upward through each half of the arena. Visual only.
+const MOTE_COUNT = 60;
+const MOTE_TOP = 7;
+function makeMotes(color, xMin, xMax) {
+  const positions = new Float32Array(MOTE_COUNT * 3);
+  for (let i = 0; i < MOTE_COUNT; i++) {
+    positions[i * 3] = xMin + Math.random() * (xMax - xMin);
+    positions[i * 3 + 1] = Math.random() * MOTE_TOP;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * (ARENA_HALF * 2 - 2);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({
+    color,
+    size: 0.2,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  scene.add(new THREE.Points(geo, mat));
+  return { geo, positions };
+}
+const motes = [
+  makeMotes(0x00f0ff, -ARENA_HALF + 1, -1),
+  makeMotes(GLITCH_COLORS[0], 1, ARENA_HALF - 1),
+];
+
+// Starfield on a far dome above the arena. Fog is off for this material so the stars stay visible.
+const STAR_COUNT = 300;
+const STAR_RADIUS = 150;
+const starPositions = new Float32Array(STAR_COUNT * 3);
+for (let i = 0; i < STAR_COUNT; i++) {
+  const y = 0.15 + Math.random() * 0.85; // upper hemisphere only
+  const r = Math.sqrt(1 - y * y);
+  const angle = Math.random() * Math.PI * 2;
+  starPositions[i * 3] = Math.cos(angle) * r * STAR_RADIUS;
+  starPositions[i * 3 + 1] = y * STAR_RADIUS;
+  starPositions[i * 3 + 2] = Math.sin(angle) * r * STAR_RADIUS;
+}
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+const starField = new THREE.Points(
+  starGeo,
+  new THREE.PointsMaterial({ color: 0xcfd8ff, size: 0.9, sizeAttenuation: false, fog: false, transparent: true, opacity: 0.8 })
+);
+scene.add(starField);
+
+// Synthwave sun behind the glitch side: a magenta disc with a dark cutout. Fog is off so it stays crisp.
+const sunGroup = new THREE.Group();
+sunGroup.position.set(30, 30, -120);
+const sunDisc = new THREE.Mesh(
+  new THREE.CircleGeometry(18, 32),
+  new THREE.MeshBasicMaterial({ color: GLITCH_COLORS[0], fog: false })
+);
+const sunCut = new THREE.Mesh(
+  new THREE.CircleGeometry(12, 32),
+  new THREE.MeshBasicMaterial({ color: SKY_COLOR, fog: false })
+);
+sunCut.position.z = 0.01; // sits just in front of the disc
+sunGroup.add(sunDisc, sunCut);
+scene.add(sunGroup);
+
+const neonCyanBase = new THREE.Color(0x00f0ff);
+const neonMagentaBase = new THREE.Color(GLITCH_COLORS[0]);
+const LIGHT_BASE_INTENSITY = 120;
+let neonTime = 0;
+
+// Breathes the neon rims and the colored lights, and drifts the motes upward (wrapping back to the floor).
+function updateNeon(dt) {
+  neonTime += dt;
+  const pulse = 0.9 + 0.1 * Math.sin(neonTime * 3);
+  neonCyan.color.copy(neonCyanBase).multiplyScalar(pulse);
+  neonMagenta.color.copy(neonMagentaBase).multiplyScalar(pulse);
+  cyanLight.intensity = LIGHT_BASE_INTENSITY * (0.85 + 0.15 * Math.sin(neonTime * 2));
+  glitchLight.intensity = LIGHT_BASE_INTENSITY * (0.85 + 0.15 * Math.sin(neonTime * 2 + Math.PI));
+  // Mostly a faint color split; occasionally a short, strong spike.
+  rgbShiftPass.uniforms.amount.value = Math.random() < 0.03 ? 0.006 : 0.0015;
+  starField.rotation.y += dt * 0.01;
+  // The floor ring breathes slowly, in step on both halves.
+  const ringPulse = 0.4 + 0.2 * Math.sin(neonTime * 2.2);
+  ringCyanMat.opacity = ringPulse;
+  ringMagentaMat.opacity = ringPulse;
+  // Each beam fades in and out on its own phase, so the pillars don't pulse in unison.
+  pillarBeams.forEach((mat, i) => {
+    mat.opacity = 0.12 + 0.1 * Math.sin(neonTime * 1.5 + i * 1.7);
+  });
+  for (const m of motes) {
+    const pos = m.positions;
+    for (let i = 1; i < pos.length; i += 3) {
+      pos[i] += dt * 0.5;
+      if (pos[i] > MOTE_TOP) pos[i] = 0;
+    }
+    m.geo.attributes.position.needsUpdate = true;
+  }
+}
 
 // ---------- Sword model ----------
 // Local space: the blade points along +Y and the handle sits at the origin.
@@ -394,11 +733,20 @@ function buildPlayerSwordMesh() {
   const sword = new THREE.Group();
 
   // Black blade with glowing edges.
-  const blade = new THREE.Mesh(
-    bladeGeo,
-    new THREE.MeshStandardMaterial({ color: SWORD_PALETTE.black, metalness: 0.7, roughness: 0.25 })
-  );
+  const bladeMat = new THREE.MeshStandardMaterial({
+    color: SWORD_PALETTE.black,
+    metalness: 0.7,
+    roughness: 0.25,
+    emissive: 0x0a3a44, // faint cyan charge, so the blade isn't a dead black shape
+  });
+  const blade = new THREE.Mesh(bladeGeo, bladeMat);
   sword.add(blade);
+
+  // Small light at the blade's midpoint. It sits on the sword, so it moves with the player's hand.
+  const bladeLight = new THREE.PointLight(SWORD_GLOW[0], 0.6, 1.2, 2);
+  bladeLight.position.set(0, 0.3, 0.1);
+  sword.add(bladeLight);
+  playerSwordFx.bladeLight = bladeLight;
 
   // Energy aura: a wider, translucent copy of the blade that flickers.
   const auraMat = new THREE.MeshBasicMaterial({
@@ -603,6 +951,8 @@ function updatePlayerSwordFx(dt) {
 
   fx.aura.color.setHex(randomOf(SWORD_GLOW));
   fx.aura.opacity = Math.random() < 0.1 ? 0.05 : 0.35 + Math.random() * 0.5;
+  // The blade light takes the same random glow color as the aura, so the lit area matches the sword.
+  if (fx.bladeLight) fx.bladeLight.color.copy(fx.aura.color);
 
   for (const s of fx.slices) {
     s.mesh.visible = Math.random() < 0.8;
@@ -767,6 +1117,7 @@ function updateGlitch(dt) {
     glitchTimer = 0.12;
     paintGlitchFloor();
     glitchMat.color.setHex(GLITCH_COLORS[Math.floor(Math.random() * GLITCH_COLORS.length)]);
+    glitchLight.color.copy(glitchMat.color);
     coreMat.color.setHex(Math.random() < 0.2 ? GLITCH_COLORS[0] : GLITCH_COLORS[1]);
   }
   for (const bar of glitchBars) {
@@ -943,8 +1294,32 @@ function buildBot() {
   botSword.rotation.x = Math.PI;
   armR.add(botSword);
 
+  // Neon details (visual only). Basic materials ignore lighting, so they stay bright.
+  // They are kept out of `mats`, so the red hit flash skips them. The hit glitch still
+  // cycles their colors, because it walks every mesh under the root.
+  const neonCyanMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff });
+  const neonMagentaMat = new THREE.MeshBasicMaterial({ color: GLITCH_COLORS[0] });
+  const glow = (w, h, d, material, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+    m.position.set(x, y, z);
+    return m;
+  };
+  // Chest stripe and visor line on the front (the bot faces -Z in its local space).
+  const chestStripe = glow(0.42, 0.06, 0.02, neonCyanMat, 0, 1.25, -0.18);
+  const visorLine = glow(0.44, 0.04, 0.02, neonMagentaMat, 0, 1.9, -0.26);
+  // Thin trim down both sides of the torso.
+  const trimL = glow(0.02, 0.75, 0.02, neonCyanMat, -0.31, 1.125, -0.18);
+  const trimR = glow(0.02, 0.75, 0.02, neonMagentaMat, 0.31, 1.125, -0.18);
+  // Halo ring floating above the head. It is tilted, so spinning the group reads as motion.
+  const halo = new THREE.Group();
+  halo.position.y = 2.55;
+  const haloRing = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.04, 8, 24), neonCyanMat);
+  haloRing.rotation.x = Math.PI / 2 - 0.45;
+  halo.add(haloRing);
+
   root.add(legL, legR, torso, head, eyeL, eyeR, armL, armR);
-  return { root, legL, legR, armL, armR, mats };
+  root.add(chestStripe, visorLine, trimL, trimR, halo);
+  return { root, legL, legR, armL, armR, mats, halo };
 }
 
 const botRig = buildBot();
@@ -1013,6 +1388,7 @@ const pauseEl = document.getElementById('pause');
 const shopEl = document.getElementById('shop');
 const shopPlayerEl = document.getElementById('shopPlayer');
 const shopCpuEl = document.getElementById('shopCpu');
+const shopArenaEl = document.getElementById('shopArena');
 const onlineEl = document.getElementById('online');
 
 function showMessage(text, seconds) {
@@ -1075,6 +1451,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
 });
 
 // ---------- Sword logic ----------
@@ -1411,6 +1788,9 @@ function setFlash(entity, on) {
 function updateBot(dt) {
   bot.hitFlash = Math.max(0, bot.hitFlash - dt);
   setFlash(bot, bot.hitFlash > 0);
+  // Halo spins while the bot is alive and hides when it's down.
+  bot.halo.visible = !bot.dead;
+  bot.halo.rotation.y += dt * 2;
   updateBotGlitch(dt);
 
   if (bot.dead) {
@@ -1514,6 +1894,7 @@ function renderShopRows(container, upgrades) {
   container.innerHTML = '';
   for (const u of upgrades) {
     const level = save.levels[u.key];
+    const max = upgradeMax(u.key);
     const row = document.createElement('div');
     row.className = 'shop-row';
 
@@ -1522,7 +1903,7 @@ function renderShopRows(container, upgrades) {
     name.className = 'shop-name';
     name.textContent = u.label;
     const level_ = document.createElement('span');
-    level_.textContent = `Lv ${level}/${MAX_LEVEL}`;
+    level_.textContent = `Lv ${level}/${max}`;
     name.appendChild(level_);
     const desc = document.createElement('div');
     desc.className = 'shop-desc';
@@ -1531,7 +1912,7 @@ function renderShopRows(container, upgrades) {
 
     const btn = document.createElement('button');
     btn.className = 'btn small';
-    if (level >= MAX_LEVEL) {
+    if (level >= max) {
       btn.textContent = 'MAX';
       btn.disabled = true;
     } else {
@@ -1549,17 +1930,24 @@ function renderShopRows(container, upgrades) {
 function renderShop() {
   renderShopRows(shopPlayerEl, PLAYER_UPGRADES);
   renderShopRows(shopCpuEl, CPU_UPGRADES);
+  renderShopRows(shopArenaEl, ARENA_UPGRADES);
   refreshCoinLabels();
 }
 
 function buyUpgrade(key) {
-  if (save.levels[key] >= MAX_LEVEL) return;
+  if (save.levels[key] >= upgradeMax(key)) return;
   const cost = upgradeCost(key);
   if (save.coins < cost) return;
   save.coins -= cost;
   save.levels[key] += 1;
   saveProgress();
   stats = computeStats();
+  // Arena upgrades change geometry that is built once at startup, so reload to rebuild the arena.
+  if (ARENA_UPGRADE_KEYS.includes(key)) {
+    // Short delay so the save write has finished before the page reloads.
+    setTimeout(() => location.reload(), 300);
+    return;
+  }
   renderShop();
 }
 
@@ -1660,7 +2048,13 @@ window.online.on('lobbies', (list) => {
   lobbiesCache = list;
   if (currentScreen === 'online') renderLobbies();
 });
-window.online.on('connection', () => setOnlineStatus('Connection lost. Refresh the page to reconnect.'));
+window.online.on('connection', (info) => {
+  if (info.ok) {
+    if (currentScreen === 'online') setOnlineStatus('Connected.');
+  } else if (currentScreen === 'online') {
+    setOnlineStatus('Connection interrupted. Reconnecting...');
+  }
+});
 window.online.on('matched', (info) => {
   setOnlineStatus('Matched! Starting...');
   // The match itself is started in the next step.
@@ -1712,7 +2106,8 @@ function animate() {
   updatePlayerSwordFx(dt);
   updateSwordArcs(dt);
   updateHUD(dt);
-  renderer.render(scene, camera);
+  updateNeon(dt);
+  composer.render();
 }
 
 // Initial state: show the main menu with the arena behind it.

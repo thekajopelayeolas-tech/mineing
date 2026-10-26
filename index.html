@@ -198,7 +198,16 @@
 
     /* Main menu: animated neon grid, colored glow spots, styled buttons, terminal subtitle */
     .menu-screen {
+      /* Corner brackets (drawn as background layers, so the grid's ::before stays intact), then glow spots */
       background:
+        linear-gradient(#00ff41, #00ff41) left 24px top 24px / 36px 2px no-repeat,
+        linear-gradient(#00ff41, #00ff41) left 24px top 24px / 2px 36px no-repeat,
+        linear-gradient(#00ff41, #00ff41) right 24px top 24px / 36px 2px no-repeat,
+        linear-gradient(#00ff41, #00ff41) right 24px top 24px / 2px 36px no-repeat,
+        linear-gradient(#00ff41, #00ff41) left 24px bottom 24px / 36px 2px no-repeat,
+        linear-gradient(#00ff41, #00ff41) left 24px bottom 24px / 2px 36px no-repeat,
+        linear-gradient(#00ff41, #00ff41) right 24px bottom 24px / 36px 2px no-repeat,
+        linear-gradient(#00ff41, #00ff41) right 24px bottom 24px / 2px 36px no-repeat,
         radial-gradient(circle at 20% 30%, rgba(255, 26, 26, 0.2), transparent 45%),
         radial-gradient(circle at 80% 70%, rgba(30, 144, 255, 0.2), transparent 45%),
         rgba(0, 0, 0, 0.85);
@@ -260,6 +269,38 @@
     .menu-btn:active:not(:disabled) {
       transform: translateX(2px) scale(0.98);
     }
+
+    /* Menu polish: title halo, a slow scan sweep, pulsing buttons.
+       The title halo uses filter, not text-shadow, because glitchFlicker animates text-shadow. */
+    .menu-screen .glitch-title {
+      filter: drop-shadow(0 0 14px rgba(255, 43, 214, 0.55)) drop-shadow(0 0 28px rgba(0, 240, 255, 0.35));
+    }
+    .menu-screen::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: -10%;
+      height: 120px;
+      background: linear-gradient(to bottom, transparent, rgba(0, 240, 255, 0.12), transparent);
+      animation: scanSweep 5s linear infinite;
+      pointer-events: none;
+      z-index: 0;
+    }
+    @keyframes scanSweep {
+      from { transform: translateY(0); }
+      to   { transform: translateY(820px); }
+    }
+    .menu-screen > * { position: relative; z-index: 1; }
+
+    .menu-btn { animation: buttonPulse 2.8s ease-in-out infinite; }
+    #menu .menu-btn:nth-of-type(2) { animation-delay: -0.9s; }
+    #menu .menu-btn:nth-of-type(3) { animation-delay: -1.8s; }
+    @keyframes buttonPulse {
+      0%, 100% { box-shadow: 0 0 12px rgba(0, 255, 65, 0.35), inset 0 0 8px rgba(255, 230, 0, 0.15); }
+      50%      { box-shadow: 0 0 20px rgba(0, 255, 65, 0.6), inset 0 0 10px rgba(255, 230, 0, 0.25); }
+    }
+    .menu-btn:hover:not(:disabled) { animation: none; }
   </style>
 </head>
 <body>
@@ -315,6 +356,9 @@
     <h2>CPU Upgrades</h2>
     <p class="hint">Stronger CPU upgrades earn you more coins per kill.</p>
     <div class="shop-list" id="shopCpu"></div>
+    <h2>Arena Upgrades</h2>
+    <p class="hint">Buying an arena upgrade reloads the page so the new arena is built.</p>
+    <div class="shop-list" id="shopArena"></div>
     <button class="btn" id="shopBackBtn">Back</button>
   </div>
 
